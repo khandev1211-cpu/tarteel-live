@@ -14,6 +14,7 @@
     --green: #3ecf6e;
     --red: #e2564f;
     --yellow: #e2b23c;
+    --orange: #e08a2c;
     --accent: #4f8cff;
   }
   * { box-sizing: border-box; }
@@ -81,6 +82,7 @@
   }
   .word.correct { color: var(--green); }
   .word.wrong { color: var(--red); background: rgba(226,86,79,0.12); }
+  .word.missed { color: var(--orange); background: rgba(224,148,60,0.12); }
   .word.pending { color: #55585f; }
   .word.current {
     background: rgba(226,178,60,0.18);
@@ -142,6 +144,11 @@
     min-height: 22px;
     direction: rtl;
   }
+  .matched-text {
+    color: var(--accent);
+    font-weight: 600;
+    margin-top: 4px;
+  }
   .conn-state { font-size: 12px; color: var(--muted); direction: ltr; }
 </style>
 </head>
@@ -160,12 +167,13 @@
   </div>
 
   <div class="raw-text" id="rawText"></div>
+  <div class="raw-text matched-text" id="matchedText"></div>
 
   <div class="controls">
     <div class="row">
       <label for="chunkSize">حجم المقطع الصوتي (Chunk size)</label>
-      <input type="range" id="chunkSize" min="500" max="3000" step="100" value="1750" />
-      <span class="val" id="chunkSizeVal">1750 ms</span>
+      <input type="range" id="chunkSize" min="1500" max="3000" step="100" value="3000" />
+      <span class="val" id="chunkSizeVal">3000 ms</span>
     </div>
     <div class="row">
       <label for="vadThreshold">حساسية كشف الصوت (VAD threshold)</label>
@@ -196,6 +204,7 @@ const statusText = document.getElementById('statusText');
 const connState = document.getElementById('connState');
 const fatihaCard = document.getElementById('fatihaCard');
 const rawText = document.getElementById('rawText');
+const matchedText = document.getElementById('matchedText');
 const chunkSizeSlider = document.getElementById('chunkSize');
 const chunkSizeVal = document.getElementById('chunkSizeVal');
 const vadSlider = document.getElementById('vadThreshold');
@@ -205,6 +214,19 @@ const stopBtn = document.getElementById('stopBtn');
 const resetBtn = document.getElementById('resetBtn');
 
 const TARGET_SAMPLE_RATE = 16000;
+
+// We prepend a small TAIL of the previous chunk (not the whole chunk) to
+// the next one before sending, so a word cut at the boundary is fully
+// present in the next chunk too. Keeping this short (instead of the entire
+// previous chunk) matters for two reasons: (1) it limits how much repeated
+// audio Whisper sees per chunk, which was pushing this Quran-tuned model
+// toward "auto-completing" memorized ayah text instead of just transcribing
+// what was actually said, and (2) the backend now diffs consecutive
+// transcripts against each other (see diff_new_words in main.py) to avoid
+// double-counting words that appear in two overlapping chunks - a shorter,
+// fixed-size overlap makes that diff cleaner and cheaper.
+const OVERLAP_MS = 400;
+let previousChunk = [];  // tail of the previous chunk's samples, kept for prepending
 
 function computeChunkSamples() {
   const ms = parseInt(chunkSizeSlider.value, 10);
@@ -276,7 +298,10 @@ function connectWS() {
     if (data.type === 'update') {
       setSpeakingState(data.speaking ? 'speaking' : 'silence');
       updateWords(data.words, data.cursor);
-      rawText.textContent = data.raw_text ? ('يسمع: ' + data.raw_text) : '';
+      rawText.textContent = data.raw_text ? ('يسمع (raw): ' + data.raw_text) : '';
+      matchedText.textContent = (data.matched_words && data.matched_words.length)
+        ? ('matched (new): ' + data.matched_words.join(' '))
+        : '';
       if (data.done) {
         statusText.textContent = 'أحسنت! تمت قراءة الفاتحة ✅';
       }
@@ -312,8 +337,22 @@ async function startMic() {
       pcmBuffer.push(resampled[i]);
     }
     while (pcmBuffer.length >= chunkSamples) {
-      const chunk = pcmBuffer.splice(0, chunkSamples);
-      sendChunk(chunk);
+      // Pull out exactly one new chunk's worth of fresh audio.
+      const newChunk = pcmBuffer.slice(0, chunkSamples);
+      pcmBuffer = pcmBuffer.slice(chunkSamples);
+
+      // Send [previous full chunk] + [this new chunk] together, so Whisper
+      // always sees the entire prior chunk as left-context. Any word that
+      // was cut off at the previous boundary is now fully contained.
+      const combined = previousChunk.length
+        ? previousChunk.concat(newChunk)
+        : newChunk;
+      sendChunk(combined);
+
+      // Only keep the last OVERLAP_MS worth of this chunk as the tail for
+      // next time - not the whole chunk.
+      const overlapSamples = Math.round(TARGET_SAMPLE_RATE * (OVERLAP_MS / 1000));
+      previousChunk = newChunk.slice(Math.max(0, newChunk.length - overlapSamples));
     }
   };
 
@@ -358,6 +397,7 @@ function stopMic() {
   if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
   if (audioCtx) audioCtx.close();
   pcmBuffer = [];
+  previousChunk = [];
 }
 
 // ---- Buttons ----
@@ -386,8 +426,10 @@ resetBtn.addEventListener('click', () => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'reset' }));
   }
+  previousChunk = [];
   loadReference();
   rawText.textContent = '';
+  matchedText.textContent = '';
   statusText.textContent = running ? 'صمت' : 'غير متصل';
 });
 

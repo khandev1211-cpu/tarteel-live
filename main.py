@@ -18,12 +18,22 @@ a reload without restarting the process.)
 """
 
 import io
+import os
 import json
 import re
 import wave
 import time
+import difflib
 import logging
 from typing import List
+
+# Once the model has been downloaded once, don't let transformers/huggingface_hub
+# phone home on every startup just to check "is there a newer version?". That
+# Hub-check is what was causing the repeated network calls / retries / crashes
+# above (especially painful if the internet drops mid-check). Setting these
+# BEFORE importing transformers forces it to use the local cache only.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import numpy as np
 import torch
@@ -39,7 +49,7 @@ log = logging.getLogger("tarteel-live")
 # --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
-MODEL_ID = "tarteel-ai/whisper-tiny-ar-quran"
+MODEL_ID = "tarteel-ai/whisper-base-ar-quran"
 SAMPLE_RATE = 16000
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -152,14 +162,64 @@ def transcribe_pcm16(pcm_bytes: bytes) -> str:
     return text
 
 
+# Whisper models are known to "hallucinate" short generic phrases on silence
+# or pure noise input instead of returning empty text. These are the most
+# common hallucinated fillers for this kind of Quran-recitation checkpoint.
+# If a transcript is *just* one of these (nothing else), we treat it as if
+# nothing was said, rather than feeding it into word matching.
+HALLUCINATION_PHRASES = {
+    "الله",
+    "بسم الله",
+    "الله الله",
+    "اللهم",
+    "استغفر الله",
+    "سبحان الله",
+    "لا اله الا الله",
+    "امين",
+}
+
+
+def is_probably_hallucinated(text: str) -> bool:
+    """Heuristic filter: drop transcripts that are empty, extremely short,
+    or match a common Whisper hallucination phrase, so they don't get fed
+    into the word-matching logic as if the user actually recited them."""
+    norm = normalize_arabic(text)
+    if not norm:
+        return True
+    if norm in HALLUCINATION_PHRASES:
+        return True
+    # A single very short word (<=2 letters) is more likely noise/breath
+    # than an actual recited word from Al-Fatiha.
+    words = norm.split()
+    if len(words) == 1 and len(words[0]) <= 2:
+        return True
+    return False
+
+
 def is_speech(pcm_bytes: bytes, threshold: float = 250.0) -> bool:
-    """Simple energy-based VAD: RMS amplitude above threshold = speech.
-    threshold is on int16 scale; tune from the frontend if needed."""
+    """Energy-based VAD with a stricter check than plain average RMS:
+    requires BOTH the overall RMS to be above threshold AND a meaningful
+    fraction of the chunk to be "active" (not just a brief click/pop).
+    This avoids classifying short noise bursts or silence-with-a-blip as
+    speech, which was previously causing not-yet-recited words to be
+    marked wrong."""
     if len(pcm_bytes) < 2:
         return False
     audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
-    rms = np.sqrt(np.mean(audio ** 2)) if len(audio) else 0.0
-    return rms > threshold
+    if len(audio) == 0:
+        return False
+
+    rms = np.sqrt(np.mean(audio ** 2))
+    if rms <= threshold:
+        return False
+
+    # Fraction of samples whose absolute amplitude exceeds a low activity
+    # floor (half the threshold) — real speech has sustained energy across
+    # a good portion of the chunk, whereas a brief pop/click doesn't.
+    activity_floor = threshold * 0.5
+    active_ratio = np.mean(np.abs(audio) > activity_floor)
+
+    return bool(rms > threshold and active_ratio > 0.15)
 
 
 # --------------------------------------------------------------------------
@@ -167,20 +227,53 @@ def is_speech(pcm_bytes: bytes, threshold: float = 250.0) -> bool:
 # progressed, so incremental chunks keep advancing rather than re-matching
 # from the start every time.
 # --------------------------------------------------------------------------
+def diff_new_words(old_words: List[str], new_words: List[str]) -> List[str]:
+    """Given the normalized word list from the PREVIOUS chunk's transcript and
+    the normalized word list from the CURRENT chunk's transcript (which
+    overlaps with the previous one, since the frontend re-sends some prior
+    audio as left-context), return only the portion of `new_words` that is
+    genuinely new — i.e. whatever comes after the last block that already
+    matched `old_words`.
+
+    This stops the same recited word from being fed into `apply_transcript`
+    twice just because it appeared in two consecutive overlapping chunks,
+    which was advancing the cursor past words that were never actually
+    skipped by the reciter (e.g. marking "الرحمن" wrong/skipped after
+    "الرحيم" repeated across chunk boundaries)."""
+    if not old_words:
+        return new_words
+    sm = difflib.SequenceMatcher(None, old_words, new_words, autojunk=False)
+    end_b = 0
+    for block in sm.get_matching_blocks():
+        if block.size > 0:
+            end_b = max(end_b, block.b + block.size)
+    return new_words[end_b:]
+
+
 class RecitationSession:
     def __init__(self):
         self.cursor = 0  # index into REFERENCE_WORDS: next expected word
         self.results = ["pending"] * len(REFERENCE_WORDS)  # per-word status
+        self.last_words: List[str] = []  # normalized words from the previous
+        # chunk's transcript, used to diff out the overlapping portion of
+        # the next chunk's transcript before matching (see diff_new_words).
 
     def reset(self):
         self.cursor = 0
         self.results = ["pending"] * len(REFERENCE_WORDS)
+        self.last_words = []
 
-    def apply_transcript(self, text: str):
-        """Greedy word-by-word alignment of newly transcribed words against
-        the next expected reference words."""
+    def apply_transcript(self, text: str) -> List[str]:
+        """Diff out the overlapping portion against the previous chunk's
+        transcript, then greedily align only the genuinely new words against
+        the next expected reference words. Returns the genuinely-new
+        (post-diff) normalized words that were actually fed into matching,
+        so the caller can show the caller/frontend exactly what was used -
+        not the raw overlapping chunk transcript."""
         words = [normalize_arabic(w) for w in text.split() if normalize_arabic(w)]
-        for w in words:
+        new_words = diff_new_words(self.last_words, words)
+        self.last_words = words
+        for w in new_words:
             if self.cursor >= len(REFERENCE_WORDS):
                 break
             expected = REFERENCE_WORDS[self.cursor]["norm"]
@@ -188,24 +281,29 @@ class RecitationSession:
                 self.results[self.cursor] = "correct"
                 self.cursor += 1
             else:
-                # try matching against the next couple of expected words
-                # (handles ASR dropping/merging a word)
-                matched_ahead = False
-                for lookahead in (1, 2):
-                    idx = self.cursor + lookahead
-                    if idx < len(REFERENCE_WORDS) and (
-                        w == REFERENCE_WORDS[idx]["norm"]
-                        or _fuzzy_match(w, REFERENCE_WORDS[idx]["norm"])
-                    ):
-                        for skip in range(self.cursor, idx):
-                            self.results[skip] = "wrong"
-                        self.results[idx] = "correct"
-                        self.cursor = idx + 1
-                        matched_ahead = True
-                        break
-                if not matched_ahead:
+                # Try matching against just the NEXT expected word (handles
+                # ASR dropping/merging one word) - kept to a single word
+                # lookahead, and an EXACT match only (no fuzzy), so a noisy
+                # or garbled ASR word can't falsely "jump" the cursor two
+                # words ahead and mark real, not-yet-recited words as wrong.
+                idx = self.cursor + 1
+                if idx < len(REFERENCE_WORDS) and w == REFERENCE_WORDS[idx]["norm"]:
+                    # The skipped-over word here was NEVER actually seen in
+                    # the transcript - the model may have genuinely mis-heard
+                    # or dropped it (short/fast words are easy for Whisper to
+                    # miss), it isn't necessarily proof the reciter said it
+                    # wrong. Mark it "missed" (distinct from "wrong") instead
+                    # of asserting a mispronunciation we have no evidence for.
+                    self.results[self.cursor] = "missed"
+                    self.results[idx] = "correct"
+                    self.cursor = idx + 1
+                else:
+                    # Here the transcribed word actively conflicts with what
+                    # was expected right now (not just absent) - this is the
+                    # one case we're confident enough to call "wrong".
                     self.results[self.cursor] = "wrong"
                     self.cursor += 1
+        return new_words
 
     def snapshot(self):
         return {
@@ -223,11 +321,20 @@ class RecitationSession:
 
 
 def _fuzzy_match(a: str, b: str) -> bool:
-    """Cheap fuzzy match: allow small edit distance for short ASR noise."""
+    """Cheap fuzzy match: allow small edit distance for short ASR noise.
+    Tightened vs. the original version: short reference words (<=3 letters,
+    e.g. single-letter-ish tokens) require an exact match - a loose fuzzy
+    threshold on a short word matches almost any garbled noise, which is
+    what was letting noisy/short-chunk transcripts falsely "match" a future
+    expected word and jump the cursor ahead of words that were never
+    actually recited. The edit-distance allowance is also capped at 2
+    regardless of word length, instead of growing with length."""
     if not a or not b:
         return False
     if a == b:
         return True
+    if len(b) <= 3:
+        return False  # too short/risky to fuzzy-match reliably
     # simple Levenshtein distance, capped for speed on short words
     la, lb = len(a), len(b)
     if abs(la - lb) > 2:
@@ -241,7 +348,7 @@ def _fuzzy_match(a: str, b: str) -> bool:
             dp[j] = prev if a[i - 1] == b[j - 1] else 1 + min(prev, dp[j], dp[j - 1])
             prev = cur
     max_len = max(la, lb)
-    return dp[lb] <= max(1, max_len // 3)
+    return dp[lb] <= min(2, max(1, max_len // 3))
 
 
 # --------------------------------------------------------------------------
@@ -298,6 +405,7 @@ async def ws_endpoint(websocket: WebSocket):
                 pcm_bytes = message["bytes"]
 
                 speaking = is_speech(pcm_bytes, threshold=vad_threshold)
+                matched_words: List[str] = []
 
                 if speaking:
                     try:
@@ -305,13 +413,18 @@ async def ws_endpoint(websocket: WebSocket):
                     except Exception as e:
                         log.exception("Transcription error")
                         text = ""
-                    if text.strip():
-                        session.apply_transcript(text)
+                    if text.strip() and not is_probably_hallucinated(text):
+                        matched_words = session.apply_transcript(text)
 
                 payload = {
                     "type": "update",
                     "speaking": speaking,
                     "raw_text": text if speaking else "",
+                    # The exact (post-diff) words that were actually fed
+                    # into matching this update - i.e. what the app treated
+                    # as "newly recited", as opposed to raw_text which still
+                    # includes the overlapping tail from the previous chunk.
+                    "matched_words": matched_words,
                     **session.snapshot(),
                 }
                 await websocket.send_text(json.dumps(payload, ensure_ascii=False))
@@ -327,7 +440,7 @@ async def ws_endpoint(websocket: WebSocket):
                     session.reset()
                     await websocket.send_text(json.dumps(
                         {"type": "update", "speaking": False, "raw_text": "",
-                         **session.snapshot()}, ensure_ascii=False))
+                         "matched_words": [], **session.snapshot()}, ensure_ascii=False))
 
                 elif ctrl.get("type") == "set_vad_threshold":
                     try:
