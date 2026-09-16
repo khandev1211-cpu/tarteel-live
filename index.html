@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Tarteel Live — سورة الفاتحة</title>
+<title>Tarteel Live — سورة الإخلاص</title>
 <style>
   :root {
     --bg: #0f1115;
@@ -61,7 +61,7 @@
   }
   .dot.idle { background: var(--muted); box-shadow: none; }
 
-  .fatiha-card {
+  .surah-card {
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 16px;
@@ -150,11 +150,18 @@
     margin-top: 4px;
   }
   .conn-state { font-size: 12px; color: var(--muted); direction: ltr; }
+  .chunk-log { max-width: 720px; width: 100%; margin-top: 18px; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 14px 18px; direction: ltr; text-align: left; }
+  .chunk-log h2 { margin: 0 0 10px; font-size: 14px; color: var(--muted); }
+  .chunk-rows { max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .chunk-row { padding: 7px 9px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .chunk-meta { color: var(--muted); margin-right: 8px; }
+  .chunk-text { color: var(--text); direction: rtl; text-align: right; display: inline-block; }
+  .chunk-silence .chunk-text { color: var(--muted); }
 </style>
 </head>
 <body>
 
-  <h1>Tarteel Live — تلاوة سورة الفاتحة</h1>
+  <h1>Tarteel Live — تلاوة سورة الإخلاص (112)</h1>
 
   <div class="status-bar">
     <div class="dot idle" id="statusDot"></div>
@@ -162,18 +169,23 @@
     <span class="conn-state" id="connState"></span>
   </div>
 
-  <div class="fatiha-card" id="fatihaCard">
+  <div class="surah-card" id="surahCard">
     جارٍ التحميل...
   </div>
 
   <div class="raw-text" id="rawText"></div>
   <div class="raw-text matched-text" id="matchedText"></div>
 
+  <section class="chunk-log" aria-label="Live chunk results">
+    <h2>Live chunk results — 1 second · audio saved for review</h2>
+    <div class="chunk-rows" id="chunkRows"></div>
+  </section>
+
   <div class="controls">
     <div class="row">
       <label for="chunkSize">حجم المقطع الصوتي (Chunk size)</label>
-      <input type="range" id="chunkSize" min="1500" max="3000" step="100" value="3000" />
-      <span class="val" id="chunkSizeVal">3000 ms</span>
+      <input type="range" id="chunkSize" min="1000" max="3000" step="100" value="1000" />
+      <span class="val" id="chunkSizeVal">1000 ms</span>
     </div>
     <div class="row">
       <label for="vadThreshold">حساسية كشف الصوت (VAD threshold)</label>
@@ -198,13 +210,15 @@ let processorNode = null;
 let pcmBuffer = [];       // accumulates Float32 samples at 16kHz until chunk boundary
 let chunkSamples = 0;     // recomputed from chunkSize slider
 let running = false;
+let chunkNumber = 0;
 
 const statusDot = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
 const connState = document.getElementById('connState');
-const fatihaCard = document.getElementById('fatihaCard');
+const surahCard = document.getElementById('surahCard');
 const rawText = document.getElementById('rawText');
 const matchedText = document.getElementById('matchedText');
+const chunkRows = document.getElementById('chunkRows');
 const chunkSizeSlider = document.getElementById('chunkSize');
 const chunkSizeVal = document.getElementById('chunkSizeVal');
 const vadSlider = document.getElementById('vadThreshold');
@@ -254,28 +268,40 @@ async function loadReference() {
 }
 
 function renderWords(words) {
-  fatihaCard.innerHTML = '';
+  surahCard.innerHTML = '';
   let lastAyah = -1;
   words.forEach((w, i) => {
     if (w.ayah !== lastAyah && lastAyah !== -1) {
-      fatihaCard.appendChild(document.createElement('span')).className = 'ayah-break';
+      surahCard.appendChild(document.createElement('span')).className = 'ayah-break';
     }
     lastAyah = w.ayah;
     const span = document.createElement('span');
     span.className = 'word ' + (w.status || 'pending');
     span.textContent = w.text;
     span.dataset.index = i;
-    fatihaCard.appendChild(span);
+    surahCard.appendChild(span);
   });
 }
 
 function updateWords(words, cursor) {
-  const spans = fatihaCard.querySelectorAll('.word');
+  const spans = surahCard.querySelectorAll('.word');
   words.forEach((w, i) => {
     const span = spans[i];
     if (!span) return;
     span.className = 'word ' + w.status + (i === cursor ? ' current' : '');
   });
+}
+
+function appendChunkResult(data) {
+  chunkNumber += 1;
+  const row = document.createElement('div');
+  row.className = 'chunk-row' + (data.speaking ? '' : ' chunk-silence');
+  const text = data.raw_text || '(silence / no speech)';
+  row.innerHTML = `<span class="chunk-meta">#${chunkNumber} · ${data.speaking ? 'speech' : 'silence'}</span><span class="chunk-text"></span>`;
+  row.querySelector('.chunk-text').textContent = text;
+  chunkRows.appendChild(row);
+  while (chunkRows.children.length > 60) chunkRows.removeChild(chunkRows.firstChild);
+  chunkRows.scrollTop = chunkRows.scrollHeight;
 }
 
 // ---- WebSocket ----
@@ -296,6 +322,7 @@ function connectWS() {
   ws.onmessage = (evt) => {
     const data = JSON.parse(evt.data);
     if (data.type === 'update') {
+      appendChunkResult(data);
       setSpeakingState(data.speaking ? 'speaking' : 'silence');
       updateWords(data.words, data.cursor);
       rawText.textContent = data.raw_text ? ('يسمع (raw): ' + data.raw_text) : '';
@@ -303,7 +330,7 @@ function connectWS() {
         ? ('matched (new): ' + data.matched_words.join(' '))
         : '';
       if (data.done) {
-        statusText.textContent = 'أحسنت! تمت قراءة الفاتحة ✅';
+        statusText.textContent = 'أحسنت! تمت قراءة سورة الإخلاص ✅';
       }
     }
   };
@@ -427,6 +454,8 @@ resetBtn.addEventListener('click', () => {
     ws.send(JSON.stringify({ type: 'reset' }));
   }
   previousChunk = [];
+  chunkNumber = 0;
+  chunkRows.innerHTML = '';
   loadReference();
   rawText.textContent = '';
   matchedText.textContent = '';

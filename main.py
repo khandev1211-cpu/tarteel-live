@@ -2,11 +2,11 @@
 Tarteel Live - Backend
 -----------------------
 FastAPI + WebSocket server that:
-  1. Loads tarteel-ai/whisper-tiny-ar-quran ONCE at startup (not per-request).
+    1. Loads the configured fine-tuned model ONCE at startup (not per-request).
   2. Accepts raw PCM16 audio chunks over a WebSocket.
   3. Runs simple energy-based VAD to detect speech vs silence.
   4. Transcribes speech chunks with Whisper and aligns the result against
-     Surah Al-Fatiha word by word.
+    Surah Al-Ikhlas (112) word by word.
   5. Sends back per-word status (correct / wrong / pending) + a
      speaking/silence indicator.
 
@@ -25,6 +25,8 @@ import wave
 import time
 import difflib
 import logging
+from datetime import datetime
+from pathlib import Path
 from typing import List
 
 # Once the model has been downloaded once, don't let transformers/huggingface_hub
@@ -41,7 +43,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from transformers import WhisperProcessor, WhisperForConditionalGeneration, GenerationConfig
+from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tarteel-live")
@@ -56,17 +58,19 @@ MODEL_ID = os.environ.get(
 PROCESSOR_ID = "tarteel-ai/whisper-base-ar-quran"
 SAMPLE_RATE = 16000
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+CHUNK_OUTPUT_DIR = Path(os.environ.get(
+    "TARTEEL_CHUNK_OUTPUT_DIR",
+    r"C:\Users\CHAND COMPUTER\Desktop\AudioSegment\output\live_chunks",
+))
 
-# Surah Al-Fatiha reference text (with basmalah), split into ayah -> words.
+# Surah Al-Ikhlas (112) reference text with basmalah, split into ayah -> words.
 # Diacritics kept minimal / normalized so matching is more forgiving.
-FATIHA_AYAT = [
+SURAH_112_AYAT = [
     "بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ",
-    "الْحَمْدُ لِلَّهِ رَبِّ الْعَالَمِينَ",
-    "الرَّحْمَٰنِ الرَّحِيمِ",
-    "مَالِكِ يَوْمِ الدِّينِ",
-    "إِيَّاكَ نَعْبُدُ وَإِيَّاكَ نَسْتَعِينُ",
-    "اهْدِنَا الصِّرَاطَ الْمُسْتَقِيمَ",
-    "صِرَاطَ الَّذِينَ أَنْعَمْتَ عَلَيْهِمْ غَيْرِ الْمَغْضُوبِ عَلَيْهِمْ وَلَا الضَّالِّينَ",
+    "قُلْ هُوَ اللَّهُ أَحَدٌ",
+    "اللَّهُ الصَّمَدُ",
+    "لَمْ يَلِدْ وَلَمْ يُولَدْ",
+    "وَلَمْ يَكُنْ لَهُ كُفُوًا أَحَدٌ",
 ]
 
 
@@ -91,7 +95,7 @@ def normalize_arabic(text: str) -> str:
 
 # Flat list of reference words (normalized) with ayah index, for alignment.
 REFERENCE_WORDS: List[dict] = []
-for ayah_idx, ayah in enumerate(FATIHA_AYAT):
+for ayah_idx, ayah in enumerate(SURAH_112_AYAT):
     for w in ayah.split():
         REFERENCE_WORDS.append({
             "display": w,
@@ -169,6 +173,17 @@ def transcribe_pcm16(pcm_bytes: bytes) -> str:
     return text
 
 
+def save_pcm16_chunk(pcm_bytes: bytes, session_dir: Path, chunk_number: int) -> Path:
+    """Persist one raw 16 kHz mono PCM16 WebSocket chunk as a WAV file."""
+    path = session_dir / f"chunk_{chunk_number:04d}.wav"
+    with wave.open(str(path), "wb") as audio_file:
+        audio_file.setnchannels(1)
+        audio_file.setsampwidth(2)
+        audio_file.setframerate(SAMPLE_RATE)
+        audio_file.writeframes(pcm_bytes)
+    return path
+
+
 # Whisper models are known to "hallucinate" short generic phrases on silence
 # or pure noise input instead of returning empty text. These are the most
 # common hallucinated fillers for this kind of Quran-recitation checkpoint.
@@ -196,7 +211,7 @@ def is_probably_hallucinated(text: str) -> bool:
     if norm in HALLUCINATION_PHRASES:
         return True
     # A single very short word (<=2 letters) is more likely noise/breath
-    # than an actual recited word from Al-Fatiha.
+    # than an actual recited word from Surah Al-Ikhlas.
     words = norm.split()
     if len(words) == 1 and len(words[0]) <= 2:
         return True
@@ -230,7 +245,7 @@ def is_speech(pcm_bytes: bytes, threshold: float = 250.0) -> bool:
 
 
 # --------------------------------------------------------------------------
-# Session state: tracks how far through Al-Fatiha each connection has
+# Session state: tracks how far through Surah Al-Ikhlas each connection has
 # progressed, so incremental chunks keep advancing rather than re-matching
 # from the start every time.
 # --------------------------------------------------------------------------
@@ -399,6 +414,12 @@ def reference():
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
     session = RecitationSession()
+    session_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    session_dir = CHUNK_OUTPUT_DIR / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    chunk_number = 0
+    metadata_path = session_dir / "chunks.jsonl"
+    metadata_file = metadata_path.open("w", encoding="utf-8")
     log.info("Client connected")
 
     # VAD threshold is adjustable live from the frontend without restarting.
@@ -410,6 +431,8 @@ async def ws_endpoint(websocket: WebSocket):
 
             if "bytes" in message and message["bytes"] is not None:
                 pcm_bytes = message["bytes"]
+                chunk_number += 1
+                chunk_path = save_pcm16_chunk(pcm_bytes, session_dir, chunk_number)
 
                 speaking = is_speech(pcm_bytes, threshold=vad_threshold)
                 matched_words: List[str] = []
@@ -434,6 +457,15 @@ async def ws_endpoint(websocket: WebSocket):
                     "matched_words": matched_words,
                     **session.snapshot(),
                 }
+                metadata_file.write(json.dumps({
+                    "chunk": chunk_number,
+                    "audio_file": chunk_path.name,
+                    "duration_sec": round(len(pcm_bytes) / 2 / SAMPLE_RATE, 4),
+                    "speaking": speaking,
+                    "transcription": text if speaking else "",
+                    "matched_words": matched_words,
+                }, ensure_ascii=False) + "\n")
+                metadata_file.flush()
                 await websocket.send_text(json.dumps(payload, ensure_ascii=False))
 
             elif "text" in message and message["text"] is not None:
@@ -460,6 +492,8 @@ async def ws_endpoint(websocket: WebSocket):
         log.info("Client disconnected")
     except Exception:
         log.exception("WebSocket error")
+    finally:
+        metadata_file.close()
 
 
 # Serve the frontend static file(s) from the same directory for convenience.

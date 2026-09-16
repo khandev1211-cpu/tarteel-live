@@ -1,4 +1,4 @@
-# Tarteel Live — Surah Al-Fatiha Live Recitation Checker
+# Tarteel Live — Surah Al-Ikhlas Live Recitation Checker
 
 This app is configured to use the custom fine-tuned Quran model from the
 AudioSegment project:
@@ -9,6 +9,11 @@ C:\Users\CHAND COMPUTER\Desktop\AudioSegment\models\whisper-100-112-600steps
 
 The backend loads this model once at startup, uses CUDA/FP16 when available,
 and keeps the existing browser microphone and live word-status interface.
+
+Live audio chunks are saved for later review under
+`C:\Users\CHAND COMPUTER\Desktop\AudioSegment\output\live_chunks\<session_id>\`.
+Each session contains one PCM16 WAV per incoming chunk and a `chunks.jsonl`
+file with timestamps, transcription, speech state, and matched words.
 
 ## Kya hai ye
   - **Backend**: `main.py` — FastAPI + WebSocket. The fine-tuned local model
@@ -94,7 +99,7 @@ whitelist kar sakte hain testing ke liye.)
   "silence" dikh raha hai to kam karein. Ye live backend ko bhejta hai, koi
   restart nahi chahiye.
 - **Start / Stop**: mic capture on/off.
-- **Reset**: Fatiha progress dobara shuru se.
+- **Reset**: Surah Al-Ikhlas progress dobara shuru se.
 
 ## Kaise kaam karta hai (short version)
 1. Browser mic se audio capture karta hai, 16kHz PCM16 mein resample karta
@@ -102,8 +107,8 @@ whitelist kar sakte hain testing ke liye.)
 2. Har chunk websocket se backend ko jata hai.
 3. Backend energy-based VAD se check karta hai speech hai ya silence
    (green/red indicator).
-4. Agar speech hai to Whisper-tiny-ar-quran se transcribe karta hai.
-5. Transcript ko Surah Al-Fatiha ke expected words ke against greedy +
+4. Agar speech hai to hamare fine-tuned Whisper model se transcribe karta hai.
+5. Transcript ko Surah Al-Ikhlas (112) ke expected words ke against greedy +
    fuzzy (chhoti edit-distance) matching se align karta hai.
 6. Result har word ke liye status bhejta hai: `correct` (green),
    `wrong` (red), `pending` (grey), aur current expected word highlight
