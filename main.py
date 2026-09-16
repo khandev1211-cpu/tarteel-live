@@ -49,7 +49,11 @@ log = logging.getLogger("tarteel-live")
 # --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
-MODEL_ID = "tarteel-ai/whisper-base-ar-quran"
+MODEL_ID = os.environ.get(
+    "TARTEEL_MODEL_PATH",
+    r"C:\Users\CHAND COMPUTER\Desktop\AudioSegment\models\whisper-100-112-600steps",
+)
+PROCESSOR_ID = "tarteel-ai/whisper-base-ar-quran"
 SAMPLE_RATE = 16000
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -101,9 +105,9 @@ for ayah_idx, ayah in enumerate(FATIHA_AYAT):
 # inference side: the frontend and matching logic can be iterated on
 # without touching this load.
 # --------------------------------------------------------------------------
-log.info(f"Loading {MODEL_ID} on {DEVICE} ...")
+log.info(f"Loading fine-tuned model {MODEL_ID} on {DEVICE} ...")
 _t0 = time.time()
-processor = WhisperProcessor.from_pretrained(MODEL_ID)
+processor = WhisperProcessor.from_pretrained(PROCESSOR_ID)
 
 # Use fp16 on GPU for speed/memory, fp32 on CPU (fp16 is slow/unsupported on CPU).
 MODEL_DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
@@ -112,16 +116,19 @@ model = WhisperForConditionalGeneration.from_pretrained(
 ).to(DEVICE)
 model.eval()
 
-# This checkpoint ships an outdated generation_config.json that predates the
-# `language=`/`task=` kwargs in generate(). Swapping in a current base-Whisper
-# generation config (same architecture/tokenizer family) fixes this
-# permanently, one time at load — not something done per chunk.
-try:
-    base_gen_config = GenerationConfig.from_pretrained("openai/whisper-tiny")
-    model.generation_config = base_gen_config
-    log.info("Patched generation_config from openai/whisper-tiny (fixes outdated config)")
-except Exception:
-    log.exception("Could not patch generation_config; language=/task= may fail")
+# Rebuild legacy language/task mappings from the local processor tokenizer.
+vocab = processor.tokenizer.get_vocab()
+model.generation_config.is_multilingual = True
+model.generation_config.lang_to_id = {
+    token: token_id for token, token_id in vocab.items()
+    if re.fullmatch(r"<\|[a-z]{2}\|>", token)
+}
+model.generation_config.task_to_id = {
+    "transcribe": vocab.get("<|transcribe|>"),
+    "translate": vocab.get("<|translate|>"),
+}
+model.generation_config.no_timestamps_token_id = vocab.get("<|notimestamps|>")
+log.info("Generation config patched from local tokenizer")
 
 
 if DEVICE == "cuda":
@@ -134,7 +141,7 @@ if DEVICE == "cuda":
         dummy_inputs = processor(dummy_audio, sampling_rate=SAMPLE_RATE, return_tensors="pt")
         dummy_features = dummy_inputs.input_features.to(DEVICE).to(MODEL_DTYPE)
         with torch.no_grad():
-            model.generate(dummy_features, language="ar", task="transcribe", max_new_tokens=8)
+            model.generate(dummy_features, language="arabic", task="transcribe", max_new_tokens=8)
         log.info("GPU warmup complete")
     except Exception:
         log.exception("GPU warmup failed (non-fatal, continuing)")
@@ -154,7 +161,7 @@ def transcribe_pcm16(pcm_bytes: bytes) -> str:
     with torch.no_grad():
         predicted_ids = model.generate(
             input_features,
-            language="ar",
+            language="arabic",
             task="transcribe",
             max_new_tokens=128,
         )

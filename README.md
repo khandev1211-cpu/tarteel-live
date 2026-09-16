@@ -1,7 +1,17 @@
 # Tarteel Live — Surah Al-Fatiha Live Recitation Checker
 
+This app is configured to use the custom fine-tuned Quran model from the
+AudioSegment project:
+
+```text
+C:\Users\CHAND COMPUTER\Desktop\AudioSegment\models\whisper-100-112-600steps
+```
+
+The backend loads this model once at startup, uses CUDA/FP16 when available,
+and keeps the existing browser microphone and live word-status interface.
+
 ## Kya hai ye
-- **Backend**: `backend.py` — FastAPI + WebSocket. Model (`tarteel-ai/whisper-tiny-ar-quran`)
+  - **Backend**: `main.py` — FastAPI + WebSocket. The fine-tuned local model
   sirf **ek dafa**, process start hote waqt load hota hai (GPU pe fp16 +
   warmup ke saath). Har audio chunk pe sirf `model.generate()` call hoti hai
   — model dubara load NAHI hota. Model dubara load karne ka koi tareeqa nahi
@@ -36,6 +46,19 @@ pip install -r requirements.txt
 
 ```bash
 uvicorn backend:app --host 0.0.0.0 --port 8000
+```
+
+From this project directory, the current command is:
+
+```bash
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+To use another local model without editing the code:
+
+```powershell
+$env:TARTEEL_MODEL_PATH = "C:\path\to\model"
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
 **`--reload` MAT lagayein.** Reload flag har file-save pe process restart
